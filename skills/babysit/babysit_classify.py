@@ -45,10 +45,31 @@ OWNER_DEFAULT = "your-org"          # GitHub org swept by `gh search prs --owner
 
 # ---- caps / limits (all lifted verbatim from the skill doc) ----------------
 STALL_LIMIT = 12       # consecutive frozen non-credit sweeps before STALLED
-BUMP_CAP = 3           # cloud @coderabbitai review bumps per sweep
+BUMP_CAP = 5           # cloud @coderabbitai review bumps per sweep (Pro = 5 PR
+                       # reviews/hr/developer; was 3 under the old limit)
 REBASE_CAP = 3         # Step 4.7 auto-rebases per sweep
 CI_TRIAGE_CAP = 2      # Step 4.6 red-CI triages per sweep
-CLI_CAP = 3            # Step 4.5 CR-CLI launches per sweep
+def _cr_seat_count():
+    """Registered CR-CLI seats that cr-review.sh can rotate across.
+
+    Zero is normal and safe: with no pool the wrapper transparently execs the
+    bare CLI, which is ONE identity at 5/hr -- so the cap must fall back to 5,
+    not the pool figure. A Reeve.Code sandbox is exactly this case, and a static
+    10 there would fire ten launches at a single 5/hr bucket."""
+    d = os.path.expanduser("~/.claude/cr-seats")
+    try:
+        return sum(1 for e in os.scandir(d) if e.is_dir()
+                   and os.path.isfile(os.path.join(e.path, ".coderabbit", "auth.json")))
+    except OSError:
+        return 0
+
+
+CLI_PER_SEAT_HOURLY = 5    # CodeRabbit Pro: 5 CLI reviews/hr PER DEVELOPER
+# Sized to the WHOLE pool, derived not hardcoded -- add a seat and the cap follows
+# with no edit here. Safe ONLY because cr-review.sh WAITS on a busy seat instead of
+# skipping it (a burst queues instead of dying on exit 75); ship the two together.
+CLI_CAP = CLI_PER_SEAT_HOURLY * max(1, _cr_seat_count())
+
 GH_ATTEMPTS = 4        # retry-on-empty attempts for EVERY gh call
 STALE_SESSION_H = 6    # >6h since last_iter_at -> fresh session, reset streak
 
