@@ -22,6 +22,9 @@ Test/determinism env overrides (unset in production):
   BABYSIT_QUIET_OVERRIDE  short-circuit is_owner_quiet -> "yes:..."/"no:..."
   BABYSIT_REPOS_ROOT      root for the recent-commit quiet scan (default ~/code)
   BABYSIT_CONCURRENCY     worker threads for per-PR classification (default 5)
+  BABYSIT_PROGRESS        path to hooks/babysit-progress.sh's JSON store, read
+                          by the waiver-store loaders below (default
+                          ~/.claude/babysit-progress.json)
 """
 import argparse
 import concurrent.futures
@@ -474,6 +477,202 @@ def plan_bumps(entries, now):
                 break
             picks.append(e)
     return picks
+
+
+# ============================================================================
+# waiver-store readers — hooks/babysit-progress.sh is the writer. This is a
+# FOUNDATION layer: a later chunk teaches classify_pr to populate each entry's
+# `cli_findings_open` from a CR-CLI harvest and wires plan_applies() below
+# into build_actions()/sweep(); until then these are tested standalone.
+# ============================================================================
+def load_cli_reviews(path=None):
+    """{"repo#pr": {head, sev{critical,major,minor,trivial}, total, rounds}}.
+
+    The severity histogram + round count the harvest records via
+    `babysit-progress.sh set-cli-review`. Missing/corrupt store -> {} so a
+    planning hint can never crash the sweep.
+    """
+    p = path or os.environ.get(
+        "BABYSIT_PROGRESS", os.path.expanduser("~/.claude/babysit-progress.json"))
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    out = {}
+    for k, v in (data.get("cli_reviewed") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        sev = v.get("sev") if isinstance(v.get("sev"), dict) else None
+        out[k] = {
+            "head": v.get("head") or "",
+            "at": v.get("at") or "",
+            "sev": sev,
+            "total": v.get("total"),
+            "rounds": int(v.get("rounds") or 0),
+        }
+    return out
+
+
+def load_cli_reviewed_heads(path=None):
+    """{"repo#pr": "<head sha>"} for every PR CR-CLI has already reviewed.
+
+    Same store the skill writes via `babysit-progress.sh set-cli-head`. A
+    planner uses this to avoid proposing a launch the skill's head gate would
+    immediately hold. Missing/unreadable/corrupt store -> {} (propose
+    everything) — a planning hint must never be able to crash the sweep.
+    """
+    p = path or os.environ.get(
+        "BABYSIT_PROGRESS", os.path.expanduser("~/.claude/babysit-progress.json"))
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    out = {}
+    for k, v in (data.get("cli_reviewed") or {}).items():
+        head = v.get("head") if isinstance(v, dict) else v
+        if isinstance(head, str) and head:
+            out[k] = head
+    return out
+
+
+def load_known_fp(path=None):
+    """{"repo#pr": reason} for every PR flagged a known false positive.
+
+    Read side of the PR-level waiver store `hooks/babysit-progress.sh`
+    writes via `add-fp` (and clears via `clear-fp`). It exists here because
+    an unapplied-findings launch gate (a later chunk) needs a way to re-open
+    a PR whose findings were legitimately declined rather than ignored:
+    gating on `cli_findings_open` alone can never clear on its own when
+    nobody pushes a fix, which would freeze such a PR out of review forever.
+    Same store the skill writes (`BABYSIT_PROGRESS`, defaulting to
+    ~/.claude/babysit-progress.json). Missing/unreadable/corrupt store -> {}
+    (nothing waived) — a planning hint must never crash the sweep.
+    """
+    p = path or os.environ.get(
+        "BABYSIT_PROGRESS", os.path.expanduser("~/.claude/babysit-progress.json"))
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    out = {}
+    for k, v in (data.get("known_fp") or {}).items():
+        if isinstance(v, dict):
+            out[k] = v.get("reason") or ""
+        elif isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def load_waived_findings(path=None):
+    """{"repo#pr": {"<finding-key>": reason}} for every individually-waived
+    CR-CLI finding.
+
+    Finding-level counterpart to load_known_fp() above. known_fp waives an
+    entire PR -- silencing it to kill one re-raised finding also blinds the
+    PR to every future REAL finding, which is exactly the gap this closes.
+    This is keyed one level deeper: repo#pr -> finding-key (caller-composed
+    at waive time, typically "<file>:<rule-id>" -- deliberately excludes the
+    line number and head SHA, both of which move on every push, so the
+    waiver survives a force-push/rebase without being re-applied) -> reason.
+    Written by `hooks/babysit-progress.sh waive`, cleared by `unwaive`.
+
+    Same store the skill writes (`BABYSIT_PROGRESS`, defaulting to
+    ~/.claude/babysit-progress.json). Missing/unreadable/corrupt store, or a
+    store written before this key existed -> {} (nothing waived) -- same
+    absent-key contract as load_known_fp/load_cli_reviewed_heads: a planning
+    hint must never crash the sweep.
+    """
+    p = path or os.environ.get(
+        "BABYSIT_PROGRESS", os.path.expanduser("~/.claude/babysit-progress.json"))
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    out = {}
+    for k, v in (data.get("waived_findings") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        keyed = {}
+        for fk, rec in v.items():
+            if isinstance(rec, dict):
+                keyed[fk] = rec.get("reason") or ""
+            elif isinstance(rec, str):
+                keyed[fk] = rec
+        if keyed:
+            out[k] = keyed
+    return out
+
+
+# ============================================================================
+# apply-queue ranking (same foundation-chunk caveat as the loaders above:
+# unwired until a later chunk gives entries a `cli_findings_open` field)
+# ============================================================================
+# Lanes that can never be merged BY THIS AUTOMATION (a different team holds
+# the button, or the base disqualifies it) — see lane_of()'s "team"/
+# "secondary"/"secondary_cohort" buckets.
+APPLY_DEPRIORITIZED_LANES = ("secondary", "secondary_cohort", "team")
+
+
+def _apply_lane_rank(lane):
+    """0 = owner lane (this automation's own merges), 1 = everything else."""
+    return 1 if lane in APPLY_DEPRIORITIZED_LANES else 0
+
+
+def _mergeability_distance(e):
+    """How many mechanical steps stand between 'findings applied' and
+    'merged', lowest first.
+
+    A MERGEABLE + CLEAN PR needs nothing else once its findings land -- the
+    apply IS the last step to `strict`, so those findings are worth the most
+    per apply. Distance rises with every additional problem an apply alone
+    cannot fix (a red check, a stale/conflicting/blocked branch): applying
+    there still leaves the PR unmergeable, so it is worth less right now even
+    though the finding is just as real."""
+    if e.get("red_failing"):
+        return 3
+    if e.get("mergeable") != "MERGEABLE":
+        return 3
+    mss = e.get("mss")
+    if mss in ("BEHIND", "DIRTY", "CONFLICTING", "BLOCKED"):
+        return 2
+    if mss == "UNSTABLE":
+        return 1
+    return 0
+
+
+def plan_applies(entries, known_fp=None):
+    """Rank PRs carrying already-harvested, unapplied CR-CLI findings.
+
+    Sort key: (lane rank, mergeability-distance, critical-first, -findings,
+    repo, number). Deterministic and side-effect-free -- same shape as
+    plan_bumps: this decides ORDER only, never whether/how a finding gets
+    applied or declined (that stays the applying worker's call, out of scope
+    here).
+
+    known_fp EXCLUSION. Finding-level waivers already fall out of this for
+    free: they reduce cli_findings_open itself (once a later chunk wires
+    that into classify_pr), so a fully-waived PR's `findings` count is
+    already 0/absent by the time it reaches here. known_fp is different --
+    it deliberately leaves cli_findings_open untouched (the PR-wide waiver
+    still SHOWS the raw signal everywhere else), so without an explicit
+    check here a whole-PR-waived PR still showed up in the apply queue -- a
+    finding adjudicated away must not schedule work either."""
+    known_fp = known_fp or {}
+    cands = [e for e in entries
+             if (e.get("cli_findings_open") or {}).get("findings")
+             and ("%s#%s" % (e["repo"], e["number"])) not in known_fp]
+    cands.sort(key=lambda e: (
+        _apply_lane_rank(e["lane"]),
+        _mergeability_distance(e),
+        0 if e["cli_findings_open"].get("critical") else 1,
+        -(e["cli_findings_open"]["findings"] or 0),
+        e["repo"], e["number"],
+    ))
+    return cands
 
 
 def build_actions(entries, now, quiet):
