@@ -504,12 +504,16 @@ def load_cli_reviews(path=None):
         if not isinstance(v, dict):
             continue
         sev = v.get("sev") if isinstance(v.get("sev"), dict) else None
+        try:
+            rounds = int(v.get("rounds") or 0)
+        except (TypeError, ValueError):
+            rounds = 0  # non-numeric rounds -> same never-crash contract as a missing store
         out[k] = {
             "head": v.get("head") or "",
             "at": v.get("at") or "",
             "sev": sev,
             "total": v.get("total"),
-            "rounds": int(v.get("rounds") or 0),
+            "rounds": rounds,
         }
     return out
 
