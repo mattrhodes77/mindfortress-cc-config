@@ -582,7 +582,7 @@ def _fetch_fail(repo, pr):
 
 def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     owner, repo, num = pr["_owner"], pr["_repo"], str(pr["number"])
-    labels = [(l.get("name") or "") for l in (pr.get("labels") or [])]
+    labels = [(lb.get("name") or "") for lb in (pr.get("labels") or [])]
 
     view = fetch_view(gh_bin, owner, repo, num)
     if view is None:
@@ -679,15 +679,13 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
 
     li = latest(cr_issues, "created_at")
     li_body = ((li or {}).get("body") or "").lower()
-    lr = latest(cr_reviews, "submitted_at")
-    lr_body = ((lr or {}).get("body") or "").lower()
 
     def has_rate(t):
         return any(p in t for p in RATE_PHRASES)
 
     # A completed "0 actionable" verdict can sit ANYWHERE in the comment history —
     # a later bump-ack often becomes the newest comment and buries it. So scan ALL
-    # CR comments/reviews for it, not just the latest (li_body/lr_body).
+    # CR comments/reviews for it, not just the latest (li_body).
     def _body(c):
         return (c.get("body") or "").lower()
     any_no_actionable = (
@@ -701,7 +699,12 @@ def classify_pr(gh_bin, pr, now, review_recs=None, waived_findings=None):
     # --- classify into ONE CR state (order = precedence) ---
     if actionable:
         state = "HAS_ACTIONABLE"
-    elif has_rate(li_body):
+    elif has_rate(li_body) or any(has_rate(_body(r)) for r in cr_reviews):
+        # Rate-limit/credit text can land as a submitted REVIEW body, not
+        # only an issue comment — scanning the latest issue comment alone
+        # let such a PR fall through to `cr_reviews non-empty -> CLEAN` and
+        # auto-merge unreviewed (the adjacent any_no_actionable scan already
+        # reads both feeds for exactly this reason).
         state = "RATE_LIMITED"          # credit-exhausted == rate-limited (ONE state)
     elif any_no_actionable:
         state = "CLEAN"                 # CR posted a "0 actionable" summary (scan ALL, not just newest)
@@ -1386,7 +1389,7 @@ def should_skip(pr):
     tl = (pr.get("title") or "").lower().strip()
     if tl.startswith("[wip") or tl.startswith("wip:") or "don't merge" in tl or "do not merge" in tl:
         return True
-    labels = {(l.get("name") or "").lower() for l in (pr.get("labels") or [])}
+    labels = {(lb.get("name") or "").lower() for lb in (pr.get("labels") or [])}
     if labels & {"do-not-merge", "wip", "dnr", "do not merge"}:
         return True
     return False

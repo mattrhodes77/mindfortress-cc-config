@@ -82,7 +82,7 @@ def rate_limited_comment(at):
 
 
 def classify(issues, *, waived_findings=None, review_recs=None,
-             head_oid=HEAD, mss="CLEAN", scr=None):
+             head_oid=HEAD, mss="CLEAN", scr=None, reviews=None):
     """Drive the real classify_pr with the gh seams stubbed out."""
     view = {
         "state": "OPEN", "headRefName": "feature/x", "headRefOid": head_oid,
@@ -93,7 +93,7 @@ def classify(issues, *, waived_findings=None, review_recs=None,
     def fake_gh_json(gh_bin, args, attempts=None):
         joined = " ".join(args)
         if "/pulls/" in joined and joined.endswith("reviews?per_page=100"):
-            return []
+            return reviews or []
         if "/pulls/" in joined and "/comments" in joined:
             return []            # no inline comments
         if "/issues/" in joined and "/comments" in joined:
@@ -407,6 +407,21 @@ class CliGreenChannelTests(unittest.TestCase):
         self.assertIsNotNone(e["cli_findings_open"],
                              "the real critical harvest must stay visible")
         self.assertTrue(e["cli_findings_open"]["critical"])
+        self.assertEqual(e["tier"], "")
+
+    def test_rate_limit_text_in_a_review_body_is_rate_limited_not_clean(self):
+        """Rate-limit/credit text can land as a submitted REVIEW body, not
+        only an issue comment. Scanning the latest issue comment alone let
+        such a PR fall through to `cr_reviews non-empty -> CLEAN` and
+        auto-merge unreviewed — the adjacent no-actionable scan already
+        reads both feeds for exactly this reason."""
+        review = {"user": {"login": "coderabbitai[bot]"},
+                  "submitted_at": "2026-01-01T01:00:00Z",
+                  "body": "Rate limit exceeded. Please wait before requesting "
+                          "another review."}
+        e = classify([], reviews=[review])
+        self.assertEqual(e["state"], "RATE_LIMITED",
+                         "a rate-limited review body must never read as CLEAN")
         self.assertEqual(e["tier"], "")
 
     def test_an_unapplied_critical_blocks_even_a_cloud_clean_pr(self):

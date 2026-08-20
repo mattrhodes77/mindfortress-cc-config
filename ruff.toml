@@ -1,0 +1,49 @@
+# ruff.toml — the lint contract `tests/test_static_checks.py::test_ruff_clean`
+# enforces.
+#
+# WHY THIS FILE EXISTS. `hooks/` is the safety spine of an autonomous coding
+# agent and `skills/babysit/babysit_classify.py` is what decides which PRs are
+# safe to auto-merge and deploy. Before this gate, CI ran `bash run-tests.sh`
+# and run-tests.sh ran pytest and nothing else — so a duplicate dict key (F601
+# silently discards the earlier value), a dead assignment, or an undefined name
+# could land in the merge-deciding module and no gate would notice. That is
+# precisely the silent-wrong-answer shape this repo's own comments keep warning
+# about, and it is exactly what a linter catches for free.
+
+# SCOPE: an explicit INCLUDE list, deliberately NOT a repo-wide check with an
+# ignore list — an ignore list added to make things green just reproduces the
+# ungated problem one level up. These are the directories that are clean and
+# that the gate now keeps clean:
+#
+#   hooks/            the safety spine — pr-gate, branch-name-gate, ...
+#   tests/            this suite
+#   skills/babysit/   the auto-merge/deploy classifier
+#
+# This list is a RATCHET, not a permanent boundary: `skills/assign/` and
+# `skills/resume-fleet/` still carry pre-existing findings (29 between them at
+# the time of writing, 25 of them E702/E741 style debt in
+# `skills/assign/assign.py`) and are out of scope here. Clean one, add it to
+# this list, and the gate never lets it regress. REMOVING an entry to make CI
+# green is the one edit this file exists to make visible in a diff.
+include = [
+    "hooks/**/*.py",
+    "tests/**/*.py",
+    "skills/babysit/**/*.py",
+]
+
+# Pinning `select` below is NOT on its own enough to stop version drift.
+# `E4`/`E7`/`E9`/`F` are rule FAMILIES: a ruff upgrade that adds a rule to any
+# of them widens the gate exactly as an unpinned default would. This bounds the
+# binary too, and it fails HARD rather than silently — ruff refuses to run at
+# all with "Required version ... does not match the running version".
+required-version = ">=0.15,<0.16"
+
+[lint]
+# RULE SET: ruff's default (`E4`, `E7`, `E9`, `F`) — pyflakes plus the
+# pycodestyle error classes that catch real mistakes, not formatting taste. It
+# is written out rather than left implicit ON PURPOSE: `select` defaults are a
+# ruff-version property, so an unpinned default means a ruff upgrade can
+# silently widen the gate (CI reddens on files nobody touched) or narrow it
+# (the gate quietly stops catching the defect class it was built for). Pinning
+# it here makes either a diff.
+select = ["E4", "E7", "E9", "F"]
