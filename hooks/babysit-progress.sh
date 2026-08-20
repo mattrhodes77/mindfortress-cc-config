@@ -16,7 +16,8 @@
 #       The skill checks this to avoid re-chewing the same non-finding each sweep.
 #       Suppresses the WHOLE PR — see waived_findings below for one adjudicated
 #       finding on an otherwise-live PR.
-#   - waived_findings[repo#pr][finding-key] = {reason, since, by} — finding-
+#   - waived_findings[repo#pr][finding-key] = {reason, since, by,
+#       authorized_by_human} — finding-
 #       level waivers. known_fp above is PR-wide: silencing it to kill one
 #       re-raised finding also blinds the PR to every future REAL finding.
 #       finding-key is caller-composed (e.g. "path/to/file.py:RULE_ID") and
@@ -177,10 +178,115 @@ case "$cmd" in
   # SHA, both of which move on every commit, and the whole acceptance is that
   # a waiver survives a force-push/rebase without being re-applied.
   waive)                # waive <repo#pr> <finding-key> <reason> [by]
-    save '.waived_findings[$k][$fk] = {reason:$r, since:$t, by:$b}' \
-      --arg k "${1:?repo#pr}" --arg fk "${2:?finding-key}" \
-      --arg r "${3:?reason}" --arg t "$(ts)" --arg b "${4:-${BABYSIT_WAIVE_BY:-unknown}}"
-    echo "waived $1 [$2]: $3" ;;
+    ensure
+    # AUTONOMOUS WAIVING IS BOUNDED (write-time gate). The nit bar — at most
+    # 5 findings, zero critical, zero major — applies to waiving too, which
+    # is strictly more powerful than skipping a re-review because it is
+    # permanent. Enforced HERE, at write time, not merely honoured
+    # downstream: the store is written by agents, and the read side cannot
+    # un-write a bad record.
+    #
+    # Fails CLOSED on an unrecorded or unparseable histogram: the bar is a
+    # claim ABOUT the findings, and with no recorded review there is nothing
+    # to check it against. "We could not look" is not "we looked and it was
+    # clean".
+    #
+    # The escape hatch NAMES the human rather than being a boolean, and that
+    # name lands in `by`, so the store records who authorized it:
+    #   BABYSIT_WAIVE_AUTHORIZED_BY=<human> babysit-progress.sh waive ...
+    #
+    # WHAT THIS IS AND IS NOT: an env var is CALLER-CONTROLLED. An agent that
+    # can run this hook can also set the variable, so this is NOT
+    # cryptographic proof that a human approved anything — nothing in this
+    # substrate could be (the same agent can edit the store file directly).
+    # What it buys, against the adversary this actually has (an agent taking
+    # the cheapest path out of apply-churn): the shortcut stops being silent.
+    # The default path refuses; clearing a critical now requires deliberately
+    # asserting a named human, and that assertion is written durably into the
+    # record where it can be read back and challenged. Deliberateness +
+    # audit, not authentication.
+    #
+    # Validate BOTH required args up front: the guard below names the
+    # finding-key in its refusals and runs BEFORE the `save` whose
+    # ${2:?finding-key} used to do this, so a missing key died as
+    # `$2: unbound variable` instead of saying which argument was missing.
+    wk="${1:?repo#pr}"
+    wfk="${2:?finding-key}"
+    # Trim the override before testing it: a whitespace-only value would pass
+    # `[ -z ]` and take the authorized path with by=" " — while the paired
+    # Python renderer strips the same variable and would render
+    # `authorized-by-human: false`. The two records of one ruling action must
+    # agree, so both sides treat blank-after-strip as UNSET.
+    auth="$(printf '%s' "${BABYSIT_WAIVE_AUTHORIZED_BY:-}" \
+              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [ -z "$auth" ]; then
+      sev="$(jq -r --arg k "$wk" '
+        if (.cli_reviewed[$k].sev // null) == null then ""
+        else (.cli_reviewed[$k]
+              | "\(.sev.critical // 0) \(.sev.major // 0) \(.total //
+                   ([.sev.critical, .sev.major, .sev.minor, .sev.trivial]
+                    | map(. // 0) | add))") end' \
+        "$STORE" 2>/dev/null || true)"
+      if [ -z "$sev" ]; then
+        echo "waive REFUSED for $wk [$wfk]: no recorded CR-CLI severity, so the" >&2
+        echo "  '<=5 findings, zero critical, zero major' bar cannot be established." >&2
+        echo "  Record the review first (set-cli-review), or authorize explicitly:" >&2
+        echo "    BABYSIT_WAIVE_AUTHORIZED_BY=<human> babysit-progress.sh waive ..." >&2
+        exit 1
+      fi
+      w_crit="$(printf '%s' "$sev" | cut -d' ' -f1)"
+      w_maj="$(printf '%s' "$sev" | cut -d' ' -f2)"
+      # `.total` is DERIVED from the histogram when absent, never defaulted
+      # to 0: a record carrying `sev` but no `total` would otherwise report 0
+      # and sail through the ">5" half of the bar — fail-open on exactly the
+      # check that bounds how much can be waived at once.
+      w_tot="$(printf '%s' "$sev" | cut -d' ' -f3)"
+      # A non-integer anywhere means the record is not one we can reason
+      # about; same closed direction as the missing case above. Each field
+      # independently: a combined pattern lets an EMPTY trailing field
+      # through, which then reaches `[ -gt 5 ]` as a bare
+      # integer-expression error.
+      for w_n in "$w_crit" "$w_maj" "$w_tot"; do
+        case "$w_n" in
+          ''|*[!0-9]*)
+            echo "waive REFUSED for $wk [$wfk]: unparseable severity record ($sev)." >&2
+            echo "    BABYSIT_WAIVE_AUTHORIZED_BY=<human> babysit-progress.sh waive ..." >&2
+            exit 1 ;;
+        esac
+      done
+      w_bad=""
+      [ "$w_crit" -gt 0 ] && w_bad="critical=$w_crit"
+      [ "$w_maj"  -gt 0 ] && w_bad="${w_bad:+$w_bad }major=$w_maj"
+      [ "$w_tot"  -gt 5 ] && w_bad="${w_bad:+$w_bad }total=$w_tot (>5)"
+      if [ -n "$w_bad" ]; then
+        echo "waive REFUSED for $wk [$wfk]: $w_bad." >&2
+        echo "  Autonomous waiving is <=5 findings, zero critical, zero major." >&2
+        echo "  A waive takes the open count toward zero, and zeroing it clears" >&2
+        echo "  the merge block -- that is how a critical ships." >&2
+        echo "  If a human has adjudicated this, record who:" >&2
+        echo "    BABYSIT_WAIVE_AUTHORIZED_BY=<human> babysit-progress.sh waive ..." >&2
+        exit 1
+      fi
+    fi
+    # The override wins over a caller-supplied `by`: `by` is just an argument
+    # an agent can pass any string to, while the override had to be set on
+    # purpose.
+    #
+    # `authorized_by_human` is that same distinction as a FIELD, and the read
+    # side needs it: "an adjudicated finding stays adjudicated -- all the way
+    # through to a merge" must keep holding for a critical a HUMAN ruled on.
+    # What must not hold is an AGENT waiving a critical to stop apply-churn.
+    # `by` alone cannot carry that difference -- an agent can pass any name
+    # as an argument -- so the flag records which PATH the write took, not
+    # what string was supplied. Absent (legacy or agent-written) reads as NOT
+    # authorized: fails closed.
+    save '.waived_findings[$k][$fk] =
+            {reason:$r, since:$t, by:$b, authorized_by_human:$auth}' \
+      --arg k "$wk" --arg fk "$wfk" \
+      --arg r "${3:?reason}" --arg t "$(ts)" \
+      --arg b "${auth:-${4:-${BABYSIT_WAIVE_BY:-unknown}}}" \
+      --argjson auth "$([ -n "$auth" ] && echo true || echo false)"
+    echo "waived $wk [$wfk]: $3" ;;
 
   unwaive)               # unwaive <repo#pr> <finding-key>  (removes ONLY that finding)
     save 'if (.waived_findings[$k] // {}) | has($fk)
