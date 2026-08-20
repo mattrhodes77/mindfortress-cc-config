@@ -59,6 +59,24 @@ Opt-out: if `$ARGUMENTS` is the literal `no-loop`, skip 0a/0b — the one-shot e
 ```
 Anything auto-proceeded lands in `~/.claude/cleanup-needed.log` — surface a "cleanup pending" note if non-empty at the end.
 
+## Step 0.5 — Recording a human ruling (WAIVE)
+
+A human ruling = a ruling made INSIDE an agent session, never a human typing into GitHub or clicking "Resolve conversation" by hand (those are not actions a session can invoke repeatably). Whenever the operator rules WAIVE on a finding — reviewing this sweep's report, or in any other session entirely — the session performs ONE ruling action, which is ALWAYS both of the following, never the store write alone:
+
+1. **Write the store**: `~/.claude/hooks/babysit-progress.sh waive <repo>#<pr> "<finding-key>" "<reason>" <by>` — the durable local record.
+2. **Post the same ruling to the PR**, rendered from the ONE source of truth so the format can never drift out of sync with its own parser:
+   ```bash
+   python3 ~/.claude/skills/babysit/babysit_classify.py ruling-comment "<finding-key>" "<reason>" <by> \
+     | gh -R <your-org>/<repo> pr comment <pr> --body-file -
+   ```
+   **Set `BABYSIT_WAIVE_AUTHORIZED_BY=<human>` on BOTH commands, or neither.** It is the same variable step 1's hook already demands for anything beyond nit-grade findings, and the renderer reads it from the environment — there is no argv flag — so the comment can never claim more authority than the store write posted beside it. Without it the comment renders `authorized-by-human: false`, which still suppresses an ordinary finding but **cannot clear a CRITICAL**: `by:` is a caller-supplied string an agent can set to anything, so it is not authorization, and letting a comment clear a critical on `by:` alone would make the durability path the way around the "no critical waiving without human input" bar.
+
+   This is the natural place, with the evidence, where reviewers can see the ruling — AND durability: `harvest_ruling_comments()` re-derives the identical waiver straight from this comment on every sweep, so a ruling made in a session that never touches this machine's store, or a store that gets lost/reset, still self-heals on the very next sweep. No re-adjudication needed.
+
+`<finding-key>` must match the `<file>:<rule-id>` convention (never a line number or head SHA — both move on a push, and the point is the ruling survives a force-push/rebase). `<by>` is who ruled, never the session. Never do step 1 without step 2 or vice versa.
+
+**Configure the trusted-author allowlist once**: set `RULING_AUTHORS_DEFAULT` in `babysit_classify.py` (or export `BABYSIT_RULING_AUTHORS`) to the GitHub login(s) your sessions comment as. Both marker formats are public, so on a public repo anyone could post a marker-shaped comment — the classifier only ever parses ruling comments AND CR-CLI harvest comments authored by these logins, and an unconfigured/empty list disables comment harvesting entirely (fail closed).
+
 ## Step 1 — Run the classifier/planner and read its JSON
 
 ONE call classifies every open PR you authored and plans every action. Pass the repo filter through if `$ARGUMENTS` is a repo list:
@@ -66,10 +84,11 @@ ONE call classifies every open PR you authored and plans every action. Pass the 
 python3 ~/.claude/skills/babysit/babysit_classify.py sweep ${ARGUMENTS:+--repos "$ARGUMENTS"}
 ```
 (Omit `--repos` for `no-loop` / empty / plain invocations.) Parse the single JSON document. Its keys:
-- `prs[]` — `{repo,number,branch,state,mergeable,mss,failing_checks,tier,lane,last_cr_activity,blurb}` per PR (`state` = CR state: CLEAN / HAS_ACTIONABLE / RATE_LIMITED / NO_REVIEW_YET / TRIGGERED_WAITING / STACKED_BLOCKED / FETCH_FAIL).
-- `greens{strict[],cosmetic_yellow[],red_ci[]}` — the authoritative merge-ready buckets. Each entry: `{repo, number, pr (same value as number), branch, base, lane, mss, failing_checks, blurb, red_failing (red_ci only)}` — the PR number is under BOTH `number` and `pr`; use either, never render a key that isn't there. **Render VERBATIM in Step 3 — do NOT reclassify.**
+- `prs[]` — `{repo,number,branch,state,mergeable,mss,failing_checks,tier,lane,last_cr_activity,blurb,cli_findings_open,ruled_via_pr_comment,green_via}` per PR (`state` = CR state: CLEAN / HAS_ACTIONABLE / RATE_LIMITED / NO_REVIEW_YET / TRIGGERED_WAITING / STACKED_BLOCKED / FETCH_FAIL). `cli_findings_open` is the CR-CLI harvest's unapplied-findings signal after waiver subtraction (null when clean/absent); `ruled_via_pr_comment[]` lists finding-keys a structured ruling comment resolved this sweep.
+- `greens{strict[],cosmetic_yellow[],red_ci[]}` — the authoritative merge-ready buckets. Each entry: `{repo, number, pr (same value as number), branch, base, lane, mss, failing_checks, blurb, green_via, red_failing (red_ci only)}` — the PR number is under BOTH `number` and `pr`; use either, never render a key that isn't there. **Render VERBATIM in Step 3 — do NOT reclassify.** `green_via` is `"cloud"` or `"cli"` — a clean CR-CLI review at the live head greens a PR on the same terms as a cloud review (it must postdate the head commit, the reviewed SHA must BE the head, it reports 0 open findings — 0 raised, or every one of them adjudicated — and it never overrules an outstanding cloud finding or a red check). **Report `green_via` on every merged green** — a `cli` green shipped on a local review, and a merge must never be silently attributed to the cloud reviewer.
 - `actions[]` — the ordered work list: `{type: bump|fix|rebase|ci_triage|cli_launch, repo, pr, why, verify_open, mode?, comments?, branch?, base?}`.
 - `reconcile_tickets[]` — merged-PR-derived ticket ids for the reconciler.
+- `ruled_via_pr_comment[]` — `{repo, pr, lane, blurb, findings[]}` per PR whose findings a structured ruling comment resolved this sweep (see Step 0.5). This is settled human debt, not open work — never render it as a needs-human row; report it as its own count so queue depth is never inflated by already-adjudicated findings.
 - `quiet` — `yes:...` / `no:reason` (gates the CR-CLI step).
 - `decision` (PROGRESSING|DRAINED|STALLED), `pending`, `fingerprint`, `streak` — the loop verdict. **Use as-is in Step 4.**
 
@@ -94,7 +113,7 @@ For EACH action: **re-confirm the PR is still OPEN first** (`gh -R <your-org>/<r
 `gh -R <your-org>/<repo> pr comment <pr> --body "@coderabbitai review"`. This spends the hour's CR credit refill; the script already capped it at 3 and rotated oldest-first. A bump is progress.
 
 ### `fix` — apply the CR's actionable inline findings (HAS_ACTIONABLE rules, VERBATIM)
-0. **False-positive short-circuit (check FIRST — the classifier's HAS_ACTIONABLE can trip on a CR ack-reply).** If `~/.claude/hooks/babysit-progress.sh is-fp <repo>#<pr>` exits 0, this PR is a known FP — skip with that reason, no worktree. Otherwise inspect the CR comments newer than the last push: if the ONLY one(s) carry a `review_comment_addressed` marker / are a CR acknowledgement reply with **no "Prompt for AI Agents" block** (no real finding), it's a false-positive — skip it AND record it so future sweeps don't re-chew it: `~/.claude/hooks/babysit-progress.sh add-fp <repo>#<pr> "CR ack-reply only, no AI-prompt finding"`. (If a genuine new finding later lands, `clear-fp` it.)
+0. **False-positive short-circuit (check FIRST — the classifier's HAS_ACTIONABLE can trip on a CR ack-reply).** If `~/.claude/hooks/babysit-progress.sh is-fp <repo>#<pr>` exits 0, this PR is a known FP — skip with that reason, no worktree. **Also check for an already-ruled finding before attempting anything**: if this finding's key already carries a `<!-- babysit:ruling ... -->` comment on the PR (see Step 0.5), or the classifier's `ruled_via_pr_comment[]`/the waiver store already cover it, do NOT re-derive a fix for it — it is settled, not open. Same shape as the FP short-circuit, different source. Otherwise inspect the CR comments newer than the last push: if the ONLY one(s) carry a `review_comment_addressed` marker / are a CR acknowledgement reply with **no "Prompt for AI Agents" block** (no real finding), it's a false-positive — skip it AND record it so future sweeps don't re-chew it: `~/.claude/hooks/babysit-progress.sh add-fp <repo>#<pr> "CR ack-reply only, no AI-prompt finding"`. (If a genuine new finding later lands, `clear-fp` it.)
 1. Find/create the worktree: `git worktree list`; if the branch isn't checked out, create a sibling at `/tmp/<repo>-<branch-short>`. Symlink `node_modules` from the main checkout. (Obey GIT-SAFETY: never reset/clean a dirty worktree.)
 2. Apply the CR's suggested fix EXACTLY when it's **mechanical** (regex, min/max bound, missing validation). If it needs architectural judgment ("refactor X to Y", "rename Z") → skip, flag NEEDS_HUMAN.
 3. **`ast.parse` is syntax-only; it does NOT catch a behavioral break.** If the fix changes runtime behavior of source-under-test you MUST run the affected suite:
@@ -133,6 +152,8 @@ Open with the auto-arm line, then `_CLI: quiet=<quiet> · harvested=<N> · launc
 - 🟢 **`strict`** and 🟡 **`cosmetic_yellow`** (annotate each 🟡 with its `failing_checks`): `owner` → ✅ **Your lane (merge now)**; `team` → ⛔ **Team's lane** (ready, but theirs to merge); `secondary` → ◽ **Secondary product — your call** (feature→develop); `secondary_cohort` → 🔑 **Cohort unblockers** (stack roots gating a cohort). Annotate stack parents with the merge procedure (merge WITHOUT `--delete-branch` → retarget child → delete branch).
 - 🔴 **`red_ci`** — surface EVERY entry with its `red_failing` checks; these are routed to `rebase`/`ci_triage`/NEEDS_HUMAN via `actions`, never folded into greens. If `red_ci` is empty, say so — the count is mandatory every sweep.
 If all three tiers are empty: "no greens this sweep."
+
+If `ruled_via_pr_comment` is non-empty, surface it on the summary line (`_Ruled this sweep: <N>_`) and name the PRs it cleared — that is the visible proof the ruling input path is working, not silence. Never render a ruled finding as a needs-human row.
 
 Then the action-results table (`| Repo | PR # | Branch | State | Action Taken | Result |`), a **Clean-list** of each CLEAN PR's `blurb`, and any NEEDS_HUMAN items (with the failing test / architectural reason). Surface cleanup debt: `python3 ~/.claude/hooks/cleanup-sweep.py --count` → if `>0`, `_🧹 Cleanup: N delete(s) pending — run /cleanup._` (never resolve it here).
 
