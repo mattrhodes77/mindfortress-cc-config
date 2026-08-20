@@ -41,7 +41,7 @@ The queue-state file `/tmp/babysit-prs-state.json` is read AND written by `babys
 ~/.claude/hooks/babysit-lock.sh acquire
 ```
 - **`LOCKED …` (exit 3)** → another live sweep owns the lock. **SKIP this entire sweep** — do NOT run the classifier, do NOT execute actions. Report one line: `_Skipped — another babysit sweep is active (lock held by <owner>, age <n>s). Cron stays armed; next fire retries._` and STOP. Do NOT release a lock you don't own.
-- **`ACQUIRED …` (exit 0)** → you hold the lock for this whole sweep. You MUST call `~/.claude/hooks/babysit-lock.sh release` at the very end (Step 4, both the PROGRESSING path and the AUTO-STOP path). The lock self-reaps after a 20-min stale TTL if a sweep ever crashes, so a missed release self-heals — but always release explicitly.
+- **`ACQUIRED …` (exit 0)** → you hold the lock for this whole sweep. You MUST call `~/.claude/hooks/babysit-lock.sh release` at the very end (Step 4, both the PROGRESSING path and the AUTO-STOP path). The stale TTL is 60 min — deliberately LONGER than every launcher's sweep cap, so a live sweep can never age out of its own lock; a crashed sweep's lock is instead reaped within seconds by its LAUNCHER (`babysit-lock.sh reap-since`, called on every exit path), and the TTL is only the backstop for a launcher that itself died. Always release explicitly.
 
 **0·progress — load the durable judgment store** (survives sessions/reboot, unlike the `/tmp` state file). This is how a fresh session resumes continuity instead of re-doing work:
 ```bash
@@ -151,7 +151,7 @@ End with the summary line matching `decision`: `ACTIVE FIXES` / `CONSUMING CREDI
 
 ## Step 4 — Decision (from the script — NEVER recompute stall logic)
 
-**0·release the mutex — ALWAYS, on every exit path of a sweep you actually ran** (both PROGRESSING and AUTO-STOP; do this before/around the decision handling so it can't be skipped): `~/.claude/hooks/babysit-lock.sh release`. (It's a no-op if you don't own the lock; the 20-min TTL self-heals a missed release, but release explicitly.) If you SKIPPED the sweep at Step 0 because it was `LOCKED`, do NOT release — you never held it.
+**0·release the mutex — ALWAYS, on every exit path of a sweep you actually ran** (both PROGRESSING and AUTO-STOP; do this before/around the decision handling so it can't be skipped): `~/.claude/hooks/babysit-lock.sh release`. (It's a no-op if you don't own the lock; a missed release is reaped by the launcher's `reap-since` on exit — the 60-min TTL is only the last-resort backstop — but release explicitly.) If you SKIPPED the sweep at Step 0 because it was `LOCKED`, do NOT release — you never held it.
 
 Use `decision` verbatim:
 - **PROGRESSING** → leave the cron armed; the loop fires again next hour. This is the default while any PR is pending — do NOT stop just because a sweep pushed no fix (a bump-only sweep is the loop working). A credit-blocked/rate-limited queue is ALWAYS PROGRESSING (the script forces `streak=0`); NEVER auto-stop on credit exhaustion and NEVER report it as needing the owner's billing action.

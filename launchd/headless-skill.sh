@@ -44,7 +44,12 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
   echo "=== $(date '+%F %T') [$NAME] fire: $PROMPT"
   # launchd PATH is minimal — give claude the tools its Bash calls expect
   export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-  timeout "$TIMEOUT" "$CLAUDE_BIN" -p "$PROMPT" --dangerously-skip-permissions
+  # `-k 60` makes the cap a BOUND, not a request: plain `timeout` sends
+  # SIGTERM only, and a wedged claude that ignores it would outlive the cap —
+  # then go stale at the lock TTL while still alive, which is exactly the
+  # live-sweep-reaped overlap the TTL sizing (hooks/babysit-lock.sh L1) rules
+  # out. SIGKILL 60s after the deadline closes that path.
+  timeout -k 60 "$TIMEOUT" "$CLAUDE_BIN" -p "$PROMPT" --dangerously-skip-permissions
   rc=$?
   echo "=== $(date '+%F %T') [$NAME] exit=$rc"
 } >>"$LOG" 2>&1
