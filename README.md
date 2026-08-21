@@ -57,6 +57,7 @@ hooks/model-preamble.sh          # SessionStart: inject a strict process-first p
 skills/briefs/                   # the six-section worker-brief contract every orchestrator's subagent prompt follows
 skills/skillify/                 # turn a repo's tribal knowledge into a project skill library (discover→map→author→review)
 tests/ + run-tests.sh            # the safety-hook regression suite (isolated temp-HOME sandboxes; CI-wired)
+ruff.toml                        # the lint contract CI enforces (explicit-include ratchet, version-pinned)
 launchd/                         # headless scheduled skills — launchd fires `claude -p` on a schedule, no open session needed
 skills/…                         # + the supporting superpowers set: using-superpowers (skill dispatch),
                                  #   using-git-worktrees, verification-before-completion,

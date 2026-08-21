@@ -10,5 +10,17 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      # ruff is not preinstalled on the hosted runners. run-tests.sh itself
+      # stays zero-install (test_ruff_clean SKIPs when ruff is absent), so a
+      # contributor without ruff still gets a green local run — but CI must
+      # never take that skip, or the lint gate is decorative. The version
+      # range matches ruff.toml's required-version pin.
+      - name: Install ruff (the lint gate must not skip in CI)
+        # `ruff --version` is the resolution check: pipx exits 0 even when
+        # its bin dir is off PATH (warning only), and an unresolvable ruff
+        # would otherwise surface only as the test's CI-strict failure.
+        run: |
+          pipx install "ruff>=0.15,<0.16"
+          ruff --version
       - name: Run safety-hook test suite
         run: bash run-tests.sh
