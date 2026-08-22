@@ -41,6 +41,7 @@ HOOK_FILES = [
     "check-worktree.sh",
     "check-freeze.sh",
     "check-no-edit-on-main.sh",
+    "ledger-append.sh",
 ]
 
 # The Linear-facing hooks are config-via-env and no-op when unconfigured, so the

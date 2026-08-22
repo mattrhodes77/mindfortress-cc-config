@@ -28,6 +28,24 @@ automated reviewer. Ticket ids use the `dev` prefix by default
 Drain your open-PR queue across the org. `babysit_classify.py` classifies every PR + plans the actions; you EXECUTE them (fixes, bumps, rebases, CI-triage, CR-CLI), then report. The script owns all classification, the greens block, the bump/rebase/triage plan, the stall/decision logic, and the state file — you never re-derive any of it. You own only the judgment work: applying mechanical fixes, resolving conflicts, interpreting CLI harvest, and writing NEEDS_HUMAN prose.
 
 Hard scope: NEVER merge PRs, NEVER push --force without --force-with-lease, NEVER touch DRAFT PRs.
+
+## EXECUTION MODE — this run is SINGLE-TURN. There is no notifier and no second turn.
+
+**Read this before anything else. It is the constraint every other rule assumes.**
+
+When this command is run headlessly (e.g. via `launchd/babysit-hourly-gate.sh`), it runs under `claude -p`: one non-interactive turn. **The moment you stop emitting tool calls, the turn ends and the process EXITS.** There is no re-invocation, no background-task notifier, and no second turn in which to "pick this up."
+
+So all of these are unreachable by construction, and every one of them ends the sweep on the spot:
+
+- *"I'll wait for the completion notification rather than poll."* — **there is no notifier here.**
+- *"The background waiter will notify me when it finishes."* — **there is no waiter.**
+- *"I'll pick this up as soon as the classifier lands."* / *"I'll resume automatically when it completes."* — **there is no later.**
+
+**Never wait for a completion signal. Poll the child yourself, with repeated tool calls, until it exits.** A step is only "awaited" if you are still emitting tool calls while it runs — a blocking foreground call, or a loop that keeps calling `sleep`/`wait`/a status check until the child is gone. Silence is not waiting; silence is exiting.
+
+**Why this rule exists, and why saying "don't stop" is not enough.** Backgrounding a long job and yielding until you are notified is *correct* in a normal interactive session — that's how an interactive supervisor learns its own sweep finished. The pattern is right in an interactive session and unreachable here, so a sweep that improvises it anyway — backgrounding the classifier and waiting for a notification headless mode never sends — exits `rc=0` well under a real sweep's runtime, having done nothing, while every observable signal (the exit code, the pipeline statuses, the fire/exit log pairing) reads healthy. Telling a sweep "do not stop" does not reach it, because **it does not believe it is stopping** — it believes it is awaiting a notification. The mechanism's absence is the load-bearing fact, so it is stated outright rather than implied.
+
+**The residue is detected, not trusted to prose.** `hooks/babysit-fire-log.sh verdict <sweep_start> <rc> <duration_s>` flags the signature — `rc=0`, a short run, and no Step 3 ledger row written since the sweep started — and the headless launcher (`launchd/babysit-hourly-gate.sh`) relaunches once on `FORFEIT`. That is a backstop for a recurrence, not a reason to relax this rule.
 </objective>
 
 <process>
@@ -83,6 +101,11 @@ ONE call classifies every open PR you authored and plans every action. Pass the 
 ```bash
 python3 ~/.claude/skills/babysit/babysit_classify.py sweep ${ARGUMENTS:+--repos "$ARGUMENTS"}
 ```
+
+**NEVER background this call.** Run it in the FOREGROUND and let the tool call block until it returns — this is the one long step in the sweep, and the step a forfeit dies on if the EXECUTION MODE rule above is not followed. The backgrounded `coderabbit review` launch under `cli_launch` below is a house pattern for that step specifically, because it harvests its children in a LATER sweep; **the classifier is not that shape** and must not inherit it. Do not detach it, do not wrap it in a completion-signalling shell, and do not "kick it off and wait" — there is nothing to wait with.
+
+If the output is too large to hold in context, redirect it to a file **and still block**: `python3 … sweep > /tmp/babysit-sweep.json` in the foreground, then read the file. If a wrapper ever returns before the work is done, that is a bug in the invocation, not a cue to go idle: poll the pid with repeated tool calls (`kill -0 <pid>`) until it is gone, then read the output. **No classifier process may outlive its sweep.**
+
 (Omit `--repos` for `no-loop` / empty / plain invocations.) Parse the single JSON document. Its keys:
 - `prs[]` — `{repo,number,branch,state,mergeable,mss,failing_checks,tier,lane,last_cr_activity,blurb,cli_findings_open,ruled_via_pr_comment,green_via}` per PR (`state` = CR state: CLEAN / HAS_ACTIONABLE / RATE_LIMITED / NO_REVIEW_YET / TRIGGERED_WAITING / STACKED_BLOCKED / FETCH_FAIL). `cli_findings_open` is the CR-CLI harvest's unapplied-findings signal after waiver subtraction (null when clean/absent); `ruled_via_pr_comment[]` lists finding-keys a structured ruling comment resolved this sweep.
 - `greens{strict[],cosmetic_yellow[],red_ci[]}` — the authoritative merge-ready buckets. Each entry: `{repo, number, pr (same value as number), branch, base, lane, mss, failing_checks, blurb, green_via, red_failing (red_ci only)}` — the PR number is under BOTH `number` and `pr`; use either, never render a key that isn't there. **Render VERBATIM in Step 3 — do NOT reclassify.** `green_via` is `"cloud"` or `"cli"` — a clean CR-CLI review at the live head greens a PR on the same terms as a cloud review (it must postdate the head commit, the reviewed SHA must BE the head, it reports 0 open findings — 0 raised, or every one of them adjudicated — and it never overrules an outstanding cloud finding or a red check). **Report `green_via` on every merged green** — a `cli` green shipped on a local review, and a merge must never be silently attributed to the cloud reviewer.
@@ -141,6 +164,8 @@ NEVER guess-patch a logic failure to make it pass — wrong-but-green is worse t
 The script only emits `cli_launch` actions when `quiet` is `yes:...` and the PR is a stacked base with 0 inline — you do NOT re-derive targets. The CLI is a SEPARATE ~3/hr quota from cloud.
 - **HARVEST first** (every sweep, regardless of quiet): for each `/tmp/cli-*.pid` whose PID is dead and whose `/tmp/cli-*.out.json` has a `{"type":"complete"}` line — re-check OPEN, parse `jq -c 'select(.type=="finding")'`, apply mechanical fixes per the `fix` rules (sibling `/tmp/<repo>-<branch>-cli` worktree), commit `fix(CR CLI #<N>)`, push, and post a `## 🤖 CodeRabbit CLI review (local)` findings comment (never on a MERGED/CLOSED PR). Read `repo`/`pr`/`branch`/`base` from the `/tmp/cli-<id>.meta` sidecar. **On a completed harvest, record the reviewed head so the next sweep won't redundantly re-review it:** `~/.claude/hooks/babysit-progress.sh set-cli-head <repo>#<pr> <the-head-sha-the-review-covered>`. Clean up pid/out on done; kill+discard runs older than 15 min.
 - **LAUNCH** each `cli_launch` action (up to the 3 already in the plan, minus in-flight): **first, re-launch ONLY when there's new code to review** — compare the current `origin/<head>` short-sha against `~/.claude/hooks/babysit-progress.sh cli-head <repo>#<pr>` (the head the last CLI review covered, durable across sessions). If they MATCH, skip the launch (re-reviewing byte-identical code just re-posts the same flagged findings and burns the ~3/hr quota) — note `CLI held — head unchanged since last review`. If they DIFFER (author pushed) or there's no record → proceed. Then confirm OPEN, reset the babysit-private worktree to the new head (obey GIT-SAFETY: skip if dirty), write a `.meta` sidecar (`repo=`/`pr=`/`branch=`/`base=`/`started=`), then background `( cd "$wt" && coderabbit review --agent --base-commit "$(git -C "$wt" merge-base HEAD origin/<base>)" > "$out" 2>&1 ) &`, record `$!` in `/tmp/cli-<id>.pid`, `disown`. A launch that errors `"errorType":"rate_limit"` → clean up silently and move on (do NOT record a head — nothing was reviewed; next sweep retries). `"errorType":"auth"` → note "run `coderabbit auth login`", skip CLI this sweep. Effects land in the NEXT sweep's harvest.
+
+  **Backgrounding here is correct for THIS launcher step only.** It works because this same sweep (or the next one) comes back later in Step 2 to harvest the child via its `.pid`/`.out.json` files — there is a consumer. The Step 1 classifier has no such consumer and must NOT inherit this pattern (see EXECUTION MODE above): backgrounding it and moving on ends the sweep with nothing read.
 
 **Budget note:** cloud bumps and CLI launches draw from separate buckets — a quiet sweep can advance up to 3+3 PRs. Watch the clock: each sweep should finish <10 min; if you hit walls, report and let the next hourly sweep continue.
 
