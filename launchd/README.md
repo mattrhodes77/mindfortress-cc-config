@@ -42,6 +42,16 @@ and only fires when there's none — or when that terminal is stuck:
   (terminal wedged on a prompt / hung) or missing (no terminal) → **run the
   backup**. It runs the backup with `HEADLESS_BABYSIT=1` so the headless
   session's own `/babysit-prs` never writes the heartbeat.
+- Once it decides to run, the gate can invoke the sweep **up to twice** in one
+  fire: `/babysit-prs` is single-turn under `claude -p`, and a sweep that
+  backgrounds its classifier and waits for a notification headless mode never
+  sends exits having done nothing (see the EXECUTION MODE section of
+  `commands/babysit-prs.md`). The gate detects that shape via
+  `hooks/babysit-fire-log.sh verdict` and relaunches exactly once, first
+  reaping any orphaned classifier process the forfeited sweep left running (a
+  reap that fails to actually kill it blocks the relaunch rather than risk
+  running two classifiers at once). A second forfeit in the same fire is not
+  retried again — that's logged as a real regression, not papered over.
 
 To use it for another skill, generalize the gate (the heartbeat detection keys
 off the skill's command name). To wire the hook, add it to both events in
